@@ -1,30 +1,15 @@
 ﻿using System;
-using System.IO;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
-using System.Text;
+using System.Threading;
 using Disquuun;
+using System.Text;
 
 namespace WagamamaWrapper
 {
-    public interface IServerContext : IDisposable
+    public class ServerContext<TContext, TRequestModel, TPushModel>
     {
-        void OnConnected(string connectionId);
-
-        void OnUpdate();
-
-        void OnMessage(string connectionId, string data);
-
-        void OnMessage(string connectionId, byte[] data);
-
-        void OnPublish(string[] connectionIds, byte[] data);
-
-        void OnDisconnected(string connectionId, string reason = "");
-    }
-
-    public class DefaultServerContext : IServerContext
-    {
-        private readonly Disquuun.Disquuun _disquuun;
-        private readonly ISerializer _serializer;
 
         private const int ConnectionIdLength = 36;
 
@@ -38,158 +23,211 @@ namespace WagamamaWrapper
         private const char StateDisconnectIntent = '4';
         private const char StateDisconnectAccidt = '5';
 
-        public DefaultServerContext(
+        private readonly Func<TContext, TRequestModel[], TPushModel[]> _onUpdate;
+        private readonly Disquuun.Disquuun _disquuun;
+        private readonly Lazy<Timer> _timer;
+        private readonly long _intervalMilliseconds;
+        private readonly ISerializer _serializer;
+        private readonly ConcurrentDictionary<string, IList<TRequestModel>> _requests;
+        private readonly ConcurrentDictionary<string, IList<TPushModel>> _responses;
+
+        private static readonly LockObject _lockObject = new LockObject();
+        private static readonly ConcurrentDictionary<string, string> _roomIdsByConectionId = new ConcurrentDictionary<string, string>();
+        private static readonly ConcurrentDictionary<string, string> _userIdsByConnectionId = new ConcurrentDictionary<string, string>();
+        private static readonly ConcurrentDictionary<string, TContext> _battleContextsByRoomId = new ConcurrentDictionary<string, TContext>();
+
+        public Action<string, Exception> OnFailDisqueConnection { get; set; }
+
+        public Action<Exception> OnFailUpdate { get; set; }
+
+        public ServerContext(
+            Func<TContext, TRequestModel[], TPushModel[]> onUpdate,
+            long intervalMilliseconds,
             string host,
             int port,
-            string contextQueueIdentity,
-            ISerializer serializer,
-            Action<Exception> connectionOpenErrorHandler = null)
+            ISerializer serializer)
         {
-            _serializer = serializer;
-            _disquuun   = new Disquuun.Disquuun(
-                host,
-                port,
-                1024,
-                3,
-                _ =>
+            _requests             = new ConcurrentDictionary<string, IList<TRequestModel>>();
+            _responses            = new ConcurrentDictionary<string, IList<TPushModel>>();
+            _intervalMilliseconds = intervalMilliseconds;
+            _onUpdate             = onUpdate;
+            _disquuun             = new Disquuun.Disquuun(host, port, 1024, 3, OnDisqueConnect);
+            _timer                = new Lazy<Timer>(() => new Timer(OnTimerElapsed, _lockObject, Timeout.Infinite, 0));
+            _serializer           = serializer;
+        }
+
+        public void Begin()
+        {
+            _timer.Value.Change(TimeSpan.Zero, TimeSpan.FromMilliseconds(_intervalMilliseconds));
+        }
+
+        public void End()
+        {
+            if (_timer.IsValueCreated)
+            {
+                _timer?.Value.Dispose();
+            }
+
+            _disquuun?.Disconnect();
+        }
+
+        private void OnConnected(string connectionId)
+        {
+            // ユーザーID取得してほげもげする
+        }
+
+        private void OnMessage(string connectionId, byte[] data)
+        {
+            var requestModel = _serializer.Deserialize<TRequestModel>(data);
+
+            var roomId = _roomIdsByConectionId[connectionId];
+
+            _requests.AddOrUpdate(
+                roomId,
+                key => new List<TRequestModel> { requestModel },
+                (key, list) =>
                 {
-                    _disquuun
-                        .GetJob(new[] { contextQueueIdentity }, "count", 1000)
-                        .Loop((command, data) =>
-                        {
-                            var jobs = DisquuunDeserializer.GetJob(data);
+                    list.Add(requestModel);
 
-                            var jobIds  = jobs.Select(x => x.jobId).ToArray();
-                            var jobData = jobs.Select(x => x.jobData).ToArray();
-
-                            _disquuun.FastAck(jobIds).Async((c, d) => { });
-
-                            foreach (var job in jobData)
-                            {
-                                var length = job.Length;
-
-                                if (length < 1 + 1 + ConnectionIdLength)
-                                {
-                                    continue;
-                                }
-
-                                var header = (char)job[0];
-
-                                switch (header)
-                                {
-                                    case HeaderString:
-                                    case HeaderBinary:
-                                    case HeaderControl:
-                                        break;
-                                    default:
-                                        continue;
-                                }
-
-                                var state = (char)job[1];
-
-                                var connectionId = Encoding.ASCII.GetString(job, 2, ConnectionIdLength);
-
-                                switch (state)
-                                {
-                                    case StateConnect:
-                                        OnConnected(connectionId);
-                                        break;
-                                    case StateStringMessage:
-                                        if (2 + ConnectionIdLength < length)
-                                        {
-                                            var message = Encoding.UTF8.GetString(job, 2 + ConnectionIdLength, length - (2 + ConnectionIdLength));
-
-                                            OnMessage(connectionId, message);
-                                        }
-                                        break;
-                                    case StateBinaryMessage:
-                                        if (2 + ConnectionIdLength < length)
-                                        {
-                                            var dataLength = length - (2 + ConnectionIdLength);
-                                            var bytes      = new byte[dataLength];
-
-                                            Buffer.BlockCopy(job, 2 + ConnectionIdLength, bytes, 0, dataLength);
-
-                                            OnMessage(connectionId, bytes);
-                                        }
-                                        break;
-                                    case StateDisconnectIntent:
-                                        OnDisconnected(connectionId, "intentional disconnect.");
-                                        break;
-                                    case StateDisconnectAccidt:
-                                        OnDisconnected(connectionId, "accidential disconnect.");
-                                        break;
-                                    default:
-                                        break;
-                                }
-
-                            }
-
-                            return true;
-                        });
-                },
-                (reason, ex) =>
-                {
-                    _disquuun?.Disconnect();
-
-                    connectionOpenErrorHandler?.Invoke(ex);
+                    return list;
                 });
         }
 
-        public void OnConnected(string connectionId)
+        private void OnUpdate()
         {
-            OnPublish(new[] { connectionId }, Encoding.UTF8.GetBytes("hello!"));
-        }
+            var results = _requests
+                .AsParallel()
+                .Select(r =>
+                {
+                    var context = _battleContextsByRoomId[r.Key];
 
-        public void OnUpdate()
-        {
-        }
+                    var pushModels = _onUpdate(context, r.Value.ToArray());
 
-        public void OnMessage(string connectionId, string data)
-        {
-            OnMessage(connectionId, Encoding.UTF8.GetBytes(data));
-        }
+                    _responses.AddOrUpdate(
+                        r.Key,
+                        key => pushModels,
+                        (key, models) => pushModels);
 
-        public void OnMessage(string connectionId, byte[] data)
-        {
-            var message = _serializer.Deserialize<string>(data) ?? Encoding.UTF8.GetString(data);
+                    return 0;
+                })
+                .ToArray();
 
-            var pushMessage = $"{connectionId} sends '{message}'";
-
-            var pushData = _serializer.Serialize(pushMessage);
-
-            OnPublish(new[] { connectionId }, pushData);
-        }
-
-        public void OnPublish(string[] connectionIds, byte[] data)
-        {
-            foreach (var connectionId in connectionIds)
+            foreach (var responses in _responses)
             {
-                _disquuun.AddJob(connectionId, data).Async((c, d) => { });
+                var data = _serializer.Serialize(responses.Value);
+
+                _disquuun.AddJob(responses.Key, data);
             }
+
+            _requests.Clear();
+            _responses.Clear();
         }
 
-        public void OnDisconnected(string connectionId, string reason = "")
+        private void OnDisconnected(string connectionId, string reason)
         {
+            // 何しよ？
         }
 
-        ~DefaultServerContext()
+        private class LockObject
         {
-            Dispose(false);
+            public bool IsLocked { get; set; }
         }
 
-        public void Dispose()
+        // コンストラクタが長くてアレなので private で切り出し
+        private void OnTimerElapsed(object state)
         {
-            Dispose(true);
-            GC.SuppressFinalize(this);
-        }
+            var lockObj = (LockObject)state;
 
-        protected virtual void Dispose(bool disposing)
-        {
-            if (disposing)
+            if (!lockObj.IsLocked)
             {
-                _disquuun.Disconnect();
+                lockObj.IsLocked = true;
+
+                try
+                {
+                    OnUpdate();
+                }
+                catch (Exception ex)
+                {
+                    OnFailUpdate?.Invoke(ex);
+                }
             }
+
+            lockObj.IsLocked = false;
+        }
+
+        private void OnDisqueConnect(string disqueId)
+        {
+            _disquuun
+                .GetJob(new[] { disqueId }, "count", 100)
+                .Loop((command, results) =>
+                {
+                    var jobs = DisquuunDeserializer.GetJob(results);
+
+                    var jobIds  = jobs.Select(x => x.jobId).ToArray();
+                    var jobData = jobs.Select(x => x.jobData).ToArray();
+
+                    foreach (var job in jobData)
+                    {
+                        var length = job.Length;
+
+                        if (length < 1 + 1 + ConnectionIdLength)
+                        {
+                            continue;
+                        }
+
+                        var header = (char)job[0];
+
+                        switch (header)
+                        {
+                            case HeaderString:
+                            case HeaderBinary:
+                            case HeaderControl:
+                                break;
+                            default:
+                                continue;
+                        }
+
+                        var state = (char)job[1];
+
+                        var connectionId = Encoding.ASCII.GetString(job, 2, ConnectionIdLength);
+
+                        switch (state)
+                        {
+                            case StateConnect:
+                                OnConnected(connectionId);
+                                break;
+                            case StateStringMessage:
+                                if (2 + ConnectionIdLength < length)
+                                {
+                                    var message = Encoding.UTF8.GetString(job, 2 + ConnectionIdLength, length - (2 + ConnectionIdLength));
+
+                                    //OnMessage(connectionId, message);
+                                }
+                                break;
+                            case StateBinaryMessage:
+                                if (2 + ConnectionIdLength < length)
+                                {
+                                    var dataLength = length - (2 + ConnectionIdLength);
+                                    var bytes = new byte[dataLength];
+
+                                    Buffer.BlockCopy(job, 2 + ConnectionIdLength, bytes, 0, dataLength);
+
+                                    OnMessage(connectionId, bytes);
+                                }
+                                break;
+                            case StateDisconnectIntent:
+                                OnDisconnected(connectionId, "intentional disconnect.");
+                                break;
+                            case StateDisconnectAccidt:
+                                OnDisconnected(connectionId, "accidential disconnect.");
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+
+                    return true;
+                });
         }
     }
 }

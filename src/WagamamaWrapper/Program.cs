@@ -1,8 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace WagamamaWrapper
 {
@@ -17,24 +13,40 @@ namespace WagamamaWrapper
                 intervalMilliseconds = 15; // frame
             }
 
-            var context = new DefaultServerContext(
-                "172.24.212.21",
-                7711,
-                "wildcard_disque_sample_context",
-                new SimpleMessageSerializer(),
-                ex => Console.WriteLine(ex));
-
-            var updater = new Updater(
+            var server = new ServerContext<IBattleContext, IRequestModel, IPushModel>(
+                (context, requests) => context.Execute(requests),
                 intervalMilliseconds,
-                () => context.OnUpdate(),
-                () => context.Dispose(),
-                exception => Console.WriteLine(exception));
+                "172.21.1.24",
+                7711,
+                new Serializer());
 
-            updater.Begin();
+            server.Begin();
 
             Console.ReadLine();
 
-            updater.End();
+            server.End();
+        }
+    }
+
+    public interface IBattleContext
+    {
+        IPushModel[] Execute(IRequestModel[] requests);
+    }
+
+    public interface IRequestModel { }
+
+    public interface IPushModel { }
+
+    public class Serializer : ISerializer
+    {
+        public byte[] Serialize<T>(T value)
+        {
+            throw new NotImplementedException();
+        }
+
+        public T Deserialize<T>(byte[] bytes)
+        {
+            throw new NotImplementedException();
         }
     }
 }
